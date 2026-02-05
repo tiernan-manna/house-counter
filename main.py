@@ -2,8 +2,10 @@
 House Counter API - Count buildings in a given radius using satellite-derived data.
 Uses Microsoft Building Footprints (ML-derived from satellite imagery) via Overture Maps.
 """
+import asyncio
 import io
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import FastAPI, Query, HTTPException
@@ -18,6 +20,9 @@ from visualization import (
     calculate_grid_size_for_zoom,
     estimate_processing_time
 )
+
+# Thread pool for running blocking operations concurrently
+executor = ThreadPoolExecutor(max_workers=8)
 
 
 app = FastAPI(
@@ -75,7 +80,10 @@ async def count_buildings(
     radius_meters = radius_km * 1000
     
     try:
-        buildings, _ = query_ms_buildings_in_radius(lat, lon, radius_meters)
+        # Run blocking query in thread pool to allow concurrent requests
+        buildings, _ = await asyncio.get_event_loop().run_in_executor(
+            executor, query_ms_buildings_in_radius, lat, lon, radius_meters
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error querying buildings: {str(e)}")
     
@@ -121,8 +129,14 @@ async def get_map_image(
     radius_meters = radius_km * 1000
     
     try:
-        buildings = get_building_polygons_ms(lat, lon, radius_meters)
-        img = create_map_image(lat, lon, radius_meters, buildings, zoom=zoom)
+        # Run blocking operations in thread pool to allow concurrent requests
+        loop = asyncio.get_event_loop()
+        buildings = await loop.run_in_executor(
+            executor, get_building_polygons_ms, lat, lon, radius_meters
+        )
+        img = await loop.run_in_executor(
+            executor, lambda: create_map_image(lat, lon, radius_meters, buildings, zoom=zoom)
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating map: {str(e)}")
     
@@ -192,13 +206,21 @@ async def count_with_map(
     grid_size = calculate_grid_size_for_zoom(radius_meters, actual_zoom, lat)
     
     try:
-        buildings, _ = query_ms_buildings_in_radius(lat, lon, radius_meters)
-        buildings_polygons = get_building_polygons_ms(lat, lon, radius_meters)
+        # Run blocking operations in thread pool to allow concurrent requests
+        loop = asyncio.get_event_loop()
+        buildings, _ = await loop.run_in_executor(
+            executor, query_ms_buildings_in_radius, lat, lon, radius_meters
+        )
+        buildings_polygons = await loop.run_in_executor(
+            executor, get_building_polygons_ms, lat, lon, radius_meters
+        )
         building_count = len(buildings)
         total_area = sum(b.area_sqm for b in buildings)
         avg_area = total_area / len(buildings) if buildings else 0
         
-        img = create_map_image(lat, lon, radius_meters, buildings_polygons, zoom=zoom)
+        img = await loop.run_in_executor(
+            executor, lambda: create_map_image(lat, lon, radius_meters, buildings_polygons, zoom=zoom)
+        )
         
         if output_path:
             img.save(output_path, format="PNG")
@@ -242,16 +264,31 @@ async def compare_data_sources(
     """
     radius_meters = radius_km * 1000
     
-    # Query both data sources
+    # Query both data sources concurrently
+    loop = asyncio.get_event_loop()
     ms_error = None
     osm_error = None
     ms_count = 0
     osm_count = 0
     ms_total_area = 0
     
+    # Run both queries in parallel
+    async def query_ms():
+        return await loop.run_in_executor(
+            executor, query_ms_buildings_in_radius, lat, lon, radius_meters
+        )
+    
+    async def query_osm():
+        return await loop.run_in_executor(
+            executor, query_osm_buildings, lat, lon, radius_meters
+        )
+    
+    ms_task = asyncio.create_task(query_ms())
+    osm_task = asyncio.create_task(query_osm())
+    
     # Microsoft Building Footprints
     try:
-        ms_buildings, _ = query_ms_buildings_in_radius(lat, lon, radius_meters)
+        ms_buildings, _ = await ms_task
         ms_count = len(ms_buildings)
         ms_total_area = sum(b.area_sqm for b in ms_buildings)
     except Exception as e:
@@ -259,7 +296,7 @@ async def compare_data_sources(
     
     # OpenStreetMap
     try:
-        osm_buildings = query_osm_buildings(lat, lon, radius_meters)
+        osm_buildings = await osm_task
         osm_count = len(osm_buildings)
     except Exception as e:
         osm_error = str(e)
@@ -310,37 +347,45 @@ async def compare_with_map(
     - Red: Microsoft Building Footprints
     - Blue: OpenStreetMap buildings
     """
-    from PIL import Image, ImageDraw
-    
     radius_meters = radius_km * 1000
     actual_zoom = zoom if zoom else calculate_zoom_for_radius(radius_meters)
+    loop = asyncio.get_event_loop()
     
-    # Get buildings from both sources
+    # Get buildings from both sources concurrently
+    async def query_ms():
+        buildings, _ = await loop.run_in_executor(
+            executor, query_ms_buildings_in_radius, lat, lon, radius_meters
+        )
+        polygons = await loop.run_in_executor(
+            executor, get_building_polygons_ms, lat, lon, radius_meters
+        )
+        return buildings, polygons
+    
+    async def query_osm():
+        return await loop.run_in_executor(
+            executor, get_osm_building_polygons, lat, lon, radius_meters
+        )
+    
+    ms_task = asyncio.create_task(query_ms())
+    osm_task = asyncio.create_task(query_osm())
+    
     try:
-        ms_buildings, _ = query_ms_buildings_in_radius(lat, lon, radius_meters)
-        ms_polygons = get_building_polygons_ms(lat, lon, radius_meters)
-    except Exception as e:
+        ms_buildings, ms_polygons = await ms_task
+    except Exception:
         ms_polygons = []
         ms_buildings = []
     
     try:
-        osm_polygons = get_osm_building_polygons(lat, lon, radius_meters)
+        osm_polygons = await osm_task
     except Exception:
         osm_polygons = []
     
     # Create base map with Microsoft buildings (red)
-    img = create_map_image(lat, lon, radius_meters, ms_polygons, zoom=zoom)
-    draw = ImageDraw.Draw(img)
-    
-    # Overlay OSM buildings in blue
-    from visualization import lat_lon_to_pixel
-    for poly in osm_polygons:
-        coords = poly.get("coordinates", [])
-        if len(coords) < 3:
-            continue
-        pixels = [lat_lon_to_pixel(c[0], c[1], actual_zoom) for c in coords]
-        # Offset to image coordinates (simplified - would need proper bounds calc)
-        # For now, just skip the OSM overlay on image since it needs coord translation
+    # Note: OSM overlay would require coordinate translation to image pixels
+    # which is complex - for now we just show Microsoft buildings on the map
+    img = await loop.run_in_executor(
+        executor, lambda: create_map_image(lat, lon, radius_meters, ms_polygons, zoom=zoom)
+    )
     
     # Save map
     filename = f"compare_map_{lat}_{lon}_{radius_km}km.png"
