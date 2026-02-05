@@ -3,6 +3,7 @@ House Counter API - Count buildings in a given radius using satellite-derived da
 Uses Microsoft Building Footprints (ML-derived from satellite imagery) via Overture Maps.
 """
 import io
+import os
 from typing import Optional
 
 from fastapi import FastAPI, Query, HTTPException
@@ -198,11 +199,12 @@ async def count_with_map(
         
         if output_path:
             img.save(output_path, format="PNG")
-            saved_path = output_path
+            saved_path = os.path.abspath(output_path)
         else:
             zoom_suffix = f"_z{actual_zoom}" if zoom else ""
-            saved_path = f"house_map_{lat}_{lon}_{radius_km}km{zoom_suffix}.png"
-            img.save(saved_path, format="PNG")
+            filename = f"house_map_{lat}_{lon}_{radius_km}km{zoom_suffix}.png"
+            img.save(filename, format="PNG")
+            saved_path = os.path.abspath(filename)
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
