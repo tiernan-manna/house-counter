@@ -75,6 +75,41 @@ Get zoom level options and timing estimates.
 curl "http://localhost:8008/zoom-info?radius_km=3"
 ```
 
+### `GET /compare`
+
+Compare building counts from Microsoft vs OpenStreetMap for validation testing.
+
+```bash
+curl "http://localhost:8008/compare?lat=36.060345&lon=-95.816314&radius_km=3"
+```
+
+**Response:**
+```json
+{
+  "latitude": 36.060345,
+  "longitude": -95.816314,
+  "radius_km": 3.0,
+  "microsoft": {
+    "building_count": 11308,
+    "total_area_sqm": 3921956.23,
+    "source": "Microsoft Building Footprints (ML from satellite)"
+  },
+  "osm": {
+    "building_count": 352,
+    "source": "OpenStreetMap (crowdsourced)"
+  },
+  "comparison": "Microsoft found +10956 more buildings (+3112.5%)"
+}
+```
+
+### `GET /compare-with-map`
+
+Compare counts and generate a map image.
+
+```bash
+curl "http://localhost:8008/compare-with-map?lat=36.060345&lon=-95.816314&radius_km=3"
+```
+
 ## Zoom Levels
 
 For a 3km radius query:
