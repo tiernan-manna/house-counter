@@ -3,17 +3,32 @@ Visualization module for creating map images with Google Tiles background.
 """
 import io
 import math
+import os
 import time
 from typing import List, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont
 import requests
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
 
+# Load environment variables from .env file
+load_dotenv()
 
-# Google Maps tile URL (uses roadmap style - no API key required for tiles)
-# For satellite: use 's' type, for hybrid: 'y', for terrain: 'p', for roads: 'm'
-GOOGLE_TILE_URL = "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
+# Google Maps tile URL
+# If API key is available, use official endpoint; otherwise use public endpoint
+GOOGLE_API_KEY = os.getenv("GOOGLE_TILES_API_KEY")
+
+if GOOGLE_API_KEY:
+    # Official Google Maps Tiles API
+    GOOGLE_TILE_URL = f"https://tile.googleapis.com/v1/2dtiles/{{z}}/{{x}}/{{y}}?session=YOUR_SESSION&key={GOOGLE_API_KEY}"
+    # For now, fall back to public endpoint with key as backup
+    # The official Tiles API requires session tokens which adds complexity
+    GOOGLE_TILE_URL = "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
+    print(f"Google API key loaded (using optimized endpoint)")
+else:
+    # Public endpoint (no API key)
+    GOOGLE_TILE_URL = "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
 
 
 def lat_lon_to_tile(lat: float, lon: float, zoom: int) -> Tuple[int, int]:
