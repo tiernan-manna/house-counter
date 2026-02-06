@@ -19,6 +19,9 @@ env/
 # Generated map images
 *.png
 
+# Building cache directory
+building_cache/
+
 # Logs
 *.log
 

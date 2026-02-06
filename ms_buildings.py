@@ -77,20 +77,63 @@ def _fetch_and_filter_buildings(
     Core query: fetch buildings from Overture Maps, filter to circular radius.
 
     Results are cached for up to _CACHE_TTL_SECONDS so repeated / identical
-    requests skip the S3 round-trip entirely.
+    requests skip the S3 round-trip entirely.  A persistent disk cache
+    (managed by CacheManager) is checked before hitting S3.
     """
     cache_key = _get_cache_key(lat, lon, radius_meters)
 
-    # -- Check cache ----------------------------------------------------------
+    # -- Check in-memory cache ------------------------------------------------
     if cache_key in _query_cache:
         cached_gdf, cached_time = _query_cache[cache_key]
         if time.time() - cached_time < _CACHE_TTL_SECONDS:
-            print(f"Cache hit for ({lat}, {lon}, {radius_meters}m)")
+            print(f"Memory cache hit for ({lat}, {lon}, {radius_meters}m)")
             return cached_gdf
         del _query_cache[cache_key]
 
-    # -- Query Overture Maps --------------------------------------------------
+    # -- Check persistent disk cache ------------------------------------------
     bbox = get_bounding_box(lat, lon, radius_meters)
+    try:
+        from cache_manager import get_cache_manager
+        disk_mgr = get_cache_manager()
+        covering = disk_mgr.find_covering_cache(bbox)
+        if covering:
+            disk_gdf = disk_mgr.load_geodataframe(covering["id"])
+            if disk_gdf is not None and len(disk_gdf) > 0:
+                print(
+                    f"Disk cache hit: '{covering['name']}' "
+                    f"({covering['building_count']} buildings)"
+                )
+                # Spatial filter: bbox then circular radius
+                min_lon, min_lat, max_lon, max_lat = bbox
+                disk_gdf = disk_gdf.cx[min_lon:max_lon, min_lat:max_lat].copy()
+
+                center = Point(lon, lat)
+                utm_crs = _get_utm_crs(lat, lon)
+                proj_utm = pyproj.Transformer.from_crs(
+                    'EPSG:4326', utm_crs, always_xy=True
+                ).transform
+                proj_wgs = pyproj.Transformer.from_crs(
+                    utm_crs, 'EPSG:4326', always_xy=True
+                ).transform
+                center_utm = transform(proj_utm, center)
+                circle_utm = center_utm.buffer(radius_meters)
+                circle_wgs = transform(proj_wgs, circle_utm)
+                disk_gdf = disk_gdf[
+                    disk_gdf.geometry.intersects(circle_wgs)
+                ].copy()
+
+                print(f"Disk cache: {len(disk_gdf)} buildings within radius")
+
+                # Populate memory cache
+                if len(_query_cache) >= _CACHE_MAX_SIZE:
+                    oldest = min(_query_cache, key=lambda k: _query_cache[k][1])
+                    del _query_cache[oldest]
+                _query_cache[cache_key] = (disk_gdf, time.time())
+                return disk_gdf
+    except Exception as exc:
+        print(f"Disk cache lookup failed (non-fatal): {exc}")
+
+    # -- Query Overture Maps --------------------------------------------------
     min_lon, min_lat, max_lon, max_lat = bbox
 
     print(f"Querying Overture Maps for buildings in bbox: {bbox}")

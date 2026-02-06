@@ -4,14 +4,18 @@ Uses Microsoft Building Footprints (ML-derived from satellite imagery) via Overt
 """
 import asyncio
 import io
+import json
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+from cache_manager import get_cache_manager
 from ms_buildings import query_ms_buildings_in_radius, get_building_polygons_ms, count_buildings_in_radius
 from osm_query import query_osm_buildings, get_osm_building_polygons
 from visualization import (
@@ -409,6 +413,162 @@ async def compare_with_map(
         "map_saved": saved_path,
         "note": "Map shows Microsoft buildings (red). OSM comparison is count-only."
     }
+
+
+# ======================================================================
+# Cache Management Endpoints
+# ======================================================================
+
+_cache_mgr = get_cache_manager()
+
+# In-flight task progress – written by worker threads, polled by SSE
+_task_progress: Dict[str, dict] = {}
+
+
+class CacheEstimateRequest(BaseModel):
+    bbox: List[float]
+
+
+class CacheStartRequest(BaseModel):
+    bbox: List[float]
+    name: str
+    center_lat: float
+    center_lon: float
+    radius_km: Optional[float] = None
+
+
+@app.get("/cache", response_class=HTMLResponse)
+async def cache_ui():
+    """Serve the cache management web UI."""
+    html_path = Path(__file__).parent / "static" / "cache_ui.html"
+    return HTMLResponse(content=html_path.read_text())
+
+
+@app.get("/cache/areas")
+async def list_cached_areas():
+    """List all cached areas with stats."""
+    return {
+        "areas": _cache_mgr.get_cached_areas(),
+        "stats": _cache_mgr.get_stats(),
+    }
+
+
+@app.post("/cache/estimate")
+async def estimate_cache(request: CacheEstimateRequest):
+    """Estimate disk size and check for overlapping cached areas."""
+    bbox = tuple(request.bbox)
+    est = _cache_mgr.estimate_cache_size(bbox)
+    overlapping = _cache_mgr.find_overlapping(bbox)
+    est["overlapping_areas"] = [
+        {"id": a["id"], "name": a["name"]} for a in overlapping
+    ]
+    return est
+
+
+@app.post("/cache/start")
+async def start_cache(request: CacheStartRequest):
+    """Start an async caching task. Returns a task_id for progress polling."""
+    bbox = tuple(request.bbox)
+
+    # Quick validation
+    est = _cache_mgr.estimate_cache_size(bbox)
+    if est["area_km2"] > 10000:
+        raise HTTPException(
+            400,
+            f"Area too large ({est['area_km2']:.0f} km²). Maximum is 10,000 km².",
+        )
+
+    task_id = uuid.uuid4().hex[:12]
+    _task_progress[task_id] = {
+        "status": "queued",
+        "progress": 0,
+        "message": "Queued…",
+    }
+
+    def _run():
+        def progress_cb(pct: int, msg: str):
+            _task_progress[task_id] = {
+                "status": "running",
+                "progress": pct,
+                "message": msg,
+            }
+
+        try:
+            result = _cache_mgr.cache_area(
+                bbox=bbox,
+                name=request.name,
+                center_lat=request.center_lat,
+                center_lon=request.center_lon,
+                radius_km=request.radius_km,
+                progress_cb=progress_cb,
+            )
+            if result:
+                _task_progress[task_id] = {
+                    "status": "complete",
+                    "progress": 100,
+                    "message": (
+                        f"Cached {result['building_count']:,} buildings "
+                        f"({result['file_size_bytes'] / (1024*1024):.1f} MB)"
+                    ),
+                    "area": result,
+                }
+            else:
+                _task_progress[task_id] = {
+                    "status": "complete",
+                    "progress": 100,
+                    "message": "No buildings found in this area.",
+                    "area": None,
+                }
+        except Exception as e:
+            _task_progress[task_id] = {
+                "status": "error",
+                "progress": 0,
+                "message": str(e),
+            }
+
+    executor.submit(_run)
+    return {"task_id": task_id}
+
+
+@app.get("/cache/progress/{task_id}")
+async def cache_progress(task_id: str):
+    """SSE endpoint streaming progress updates for a caching task."""
+    if task_id not in _task_progress:
+        raise HTTPException(404, "Task not found")
+
+    async def event_stream():
+        last_sent = None
+        deadline = asyncio.get_event_loop().time() + 600  # 10 min timeout
+        while asyncio.get_event_loop().time() < deadline:
+            current = _task_progress.get(task_id)
+            if current and current != last_sent:
+                yield f"data: {json.dumps(current)}\n\n"
+                last_sent = current.copy()
+                if current.get("status") in ("complete", "error"):
+                    # Keep entry for 30 s so late pollers can see it
+                    await asyncio.sleep(1)
+                    break
+            await asyncio.sleep(0.4)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.delete("/cache/areas/{area_id}")
+async def delete_cached_area(area_id: str):
+    """Delete a cached area from disk."""
+    if _cache_mgr.delete_area(area_id):
+        return {"success": True}
+    raise HTTPException(404, "Area not found")
+
+
+@app.get("/cache/stats")
+async def cache_stats():
+    """Return aggregate cache statistics."""
+    return _cache_mgr.get_stats()
 
 
 if __name__ == "__main__":
