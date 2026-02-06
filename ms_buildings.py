@@ -5,15 +5,23 @@ Uses the official overturemaps library for optimized access.
 No API key required - data is publicly accessible.
 """
 import math
-from typing import List, Tuple
+import time
+from typing import Dict, List, Tuple
 from dataclasses import dataclass
 import geopandas as gpd
-from shapely.geometry import Point, box
+from shapely.geometry import Point
 from shapely.ops import transform
 import pyproj
 
-# Import overturemaps library
 import overturemaps
+
+
+# ---------------------------------------------------------------------------
+# Cache for Overture Maps query results (avoids repeated S3 round-trips)
+# ---------------------------------------------------------------------------
+_query_cache: Dict[tuple, Tuple[gpd.GeoDataFrame, float]] = {}
+_CACHE_MAX_SIZE = 50
+_CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
 @dataclass
@@ -33,18 +41,139 @@ def get_bounding_box(lat: float, lon: float, radius_meters: float) -> Tuple[floa
     """
     R = 6371000  # Earth's radius in meters
     angular_distance = radius_meters / R
-    
+
     lat_rad = math.radians(lat)
     lon_rad = math.radians(lon)
-    
+
     min_lat = math.degrees(lat_rad - angular_distance)
     max_lat = math.degrees(lat_rad + angular_distance)
-    
+
     delta_lon = math.asin(math.sin(angular_distance) / math.cos(lat_rad))
     min_lon = math.degrees(lon_rad - delta_lon)
     max_lon = math.degrees(lon_rad + delta_lon)
-    
+
     return (min_lon, min_lat, max_lon, max_lat)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _get_cache_key(lat: float, lon: float, radius_meters: float) -> tuple:
+    """Deterministic cache key rounded to avoid floating-point duplicates."""
+    return (round(lat, 6), round(lon, 6), round(radius_meters, 1))
+
+
+def _get_utm_crs(lat: float, lon: float) -> str:
+    """Return the UTM CRS string for the given lat/lon."""
+    utm_zone = int((lon + 180) / 6) + 1
+    return f"EPSG:{32600 + utm_zone}" if lat >= 0 else f"EPSG:{32700 + utm_zone}"
+
+
+def _fetch_and_filter_buildings(
+    lat: float, lon: float, radius_meters: float
+) -> gpd.GeoDataFrame:
+    """
+    Core query: fetch buildings from Overture Maps, filter to circular radius.
+
+    Results are cached for up to _CACHE_TTL_SECONDS so repeated / identical
+    requests skip the S3 round-trip entirely.
+    """
+    cache_key = _get_cache_key(lat, lon, radius_meters)
+
+    # -- Check cache ----------------------------------------------------------
+    if cache_key in _query_cache:
+        cached_gdf, cached_time = _query_cache[cache_key]
+        if time.time() - cached_time < _CACHE_TTL_SECONDS:
+            print(f"Cache hit for ({lat}, {lon}, {radius_meters}m)")
+            return cached_gdf
+        del _query_cache[cache_key]
+
+    # -- Query Overture Maps --------------------------------------------------
+    bbox = get_bounding_box(lat, lon, radius_meters)
+    min_lon, min_lat, max_lon, max_lat = bbox
+
+    print(f"Querying Overture Maps for buildings in bbox: {bbox}")
+    t0 = time.time()
+
+    try:
+        bbox_tuple = (min_lon, min_lat, max_lon, max_lat)
+        gdf = overturemaps.record_batch_reader("building", bbox_tuple).read_all().to_pandas()
+        print(f"Query returned {len(gdf)} buildings from Overture Maps ({time.time() - t0:.1f}s)")
+
+        if len(gdf) == 0:
+            empty = gpd.GeoDataFrame()
+            _query_cache[cache_key] = (empty, time.time())
+            return empty
+
+        if 'geometry' in gdf.columns:
+            from shapely import wkb
+            if isinstance(gdf['geometry'].iloc[0], bytes):
+                gdf['geometry'] = gdf['geometry'].apply(lambda x: wkb.loads(x) if x else None)
+            gdf = gpd.GeoDataFrame(gdf, geometry='geometry', crs='EPSG:4326')
+        else:
+            print("No geometry column found")
+            empty = gpd.GeoDataFrame()
+            _query_cache[cache_key] = (empty, time.time())
+            return empty
+
+    except Exception as e:
+        print(f"Error querying Overture Maps: {e}")
+        import traceback
+        traceback.print_exc()
+        return gpd.GeoDataFrame()
+
+    # -- Filter to circular radius -------------------------------------------
+    center = Point(lon, lat)
+    utm_crs = _get_utm_crs(lat, lon)
+
+    project_to_utm = pyproj.Transformer.from_crs('EPSG:4326', utm_crs, always_xy=True).transform
+    project_to_wgs = pyproj.Transformer.from_crs(utm_crs, 'EPSG:4326', always_xy=True).transform
+
+    center_utm = transform(project_to_utm, center)
+    search_circle_utm = center_utm.buffer(radius_meters)
+    search_circle = transform(project_to_wgs, search_circle_utm)
+
+    gdf = gdf[gdf.geometry.intersects(search_circle)].copy()
+    print(f"Buildings within {radius_meters}m radius: {len(gdf)} ({time.time() - t0:.1f}s total)")
+
+    # -- Cache the filtered result -------------------------------------------
+    if len(_query_cache) >= _CACHE_MAX_SIZE:
+        oldest_key = min(_query_cache, key=lambda k: _query_cache[k][1])
+        del _query_cache[oldest_key]
+    _query_cache[cache_key] = (gdf, time.time())
+
+    return gdf
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def count_buildings_in_radius(
+    lat: float, lon: float, radius_meters: float
+) -> Tuple[int, float, float]:
+    """
+    Fast count-only query — no Building objects, no per-row loops.
+
+    Returns:
+        (building_count, total_area_sqm, avg_area_sqm)
+    """
+    gdf = _fetch_and_filter_buildings(lat, lon, radius_meters)
+
+    if len(gdf) == 0:
+        return 0, 0.0, 0.0
+
+    # Vectorized area calculation via bulk CRS projection
+    utm_crs = _get_utm_crs(lat, lon)
+    gdf_utm = gdf.to_crs(utm_crs)
+    areas = gdf_utm.area
+
+    count = len(gdf)
+    total_area = float(areas.sum())
+    avg_area = total_area / count
+
+    return count, round(total_area, 2), round(avg_area, 2)
 
 
 def query_ms_buildings_in_radius(
@@ -53,101 +182,40 @@ def query_ms_buildings_in_radius(
     radius_meters: float
 ) -> Tuple[List[Building], gpd.GeoDataFrame]:
     """
-    Query building footprints from Overture Maps (includes Microsoft buildings).
-    
-    Uses the overturemaps library which provides optimized access to the data.
-    No API key required.
-    
-    Args:
-        lat: Center latitude
-        lon: Center longitude
-        radius_meters: Search radius in meters
-        
-    Returns:
-        Tuple of (list of Building objects, GeoDataFrame with all buildings)
+    Query building footprints and return Building objects + GeoDataFrame.
+
+    Uses vectorized CRS projection and cached queries for speed.
     """
-    bbox = get_bounding_box(lat, lon, radius_meters)
-    min_lon, min_lat, max_lon, max_lat = bbox
-    
-    print(f"Querying Overture Maps for buildings in bbox: {bbox}")
-    print("This may take a moment...")
-    
-    try:
-        # Use overturemaps library to query buildings
-        # The library handles the partitioning and efficient querying
-        bbox_tuple = (min_lon, min_lat, max_lon, max_lat)
-        
-        # Query the buildings type
-        gdf = overturemaps.record_batch_reader("building", bbox_tuple).read_all().to_pandas()
-        
-        print(f"Query returned {len(gdf)} buildings from Overture Maps")
-        
-        if len(gdf) == 0:
-            return [], gpd.GeoDataFrame()
-        
-        # Convert to GeoDataFrame if not already
-        if 'geometry' in gdf.columns:
-            # The geometry might be in WKB format
-            from shapely import wkb
-            if isinstance(gdf['geometry'].iloc[0], bytes):
-                gdf['geometry'] = gdf['geometry'].apply(lambda x: wkb.loads(x) if x else None)
-            
-            gdf = gpd.GeoDataFrame(gdf, geometry='geometry', crs='EPSG:4326')
-        else:
-            print("No geometry column found")
-            return [], gpd.GeoDataFrame()
-        
-    except Exception as e:
-        print(f"Error querying Overture Maps: {e}")
-        import traceback
-        traceback.print_exc()
+    gdf = _fetch_and_filter_buildings(lat, lon, radius_meters)
+
+    if len(gdf) == 0:
         return [], gpd.GeoDataFrame()
-    
-    # Create search circle for more precise filtering
-    center = Point(lon, lat)
-    
-    # Project to UTM for accurate distance calculation
-    utm_zone = int((lon + 180) / 6) + 1
-    utm_crs = f"EPSG:{32600 + utm_zone}" if lat >= 0 else f"EPSG:{32700 + utm_zone}"
-    
-    project_to_utm = pyproj.Transformer.from_crs('EPSG:4326', utm_crs, always_xy=True).transform
-    project_to_wgs = pyproj.Transformer.from_crs(utm_crs, 'EPSG:4326', always_xy=True).transform
-    
-    center_utm = transform(project_to_utm, center)
-    search_circle_utm = center_utm.buffer(radius_meters)
-    search_circle = transform(project_to_wgs, search_circle_utm)
-    
-    # Filter to buildings within the radius (the bbox is slightly larger)
-    gdf = gdf[gdf.geometry.intersects(search_circle)]
-    
-    print(f"Buildings within {radius_meters}m radius: {len(gdf)}")
-    
-    # Convert to Building objects
+
+    # Vectorized projection & area calculation (one bulk operation, not per-row)
+    utm_crs = _get_utm_crs(lat, lon)
+    gdf_utm = gdf.to_crs(utm_crs)
+    area_values = gdf_utm.area.values
+    centroids = gdf.geometry.centroid
+
     buildings = []
-    for idx, row in gdf.iterrows():
+    for i, (idx, row) in enumerate(gdf.iterrows()):
         try:
-            centroid = row.geometry.centroid
-            
-            # Calculate area in square meters
-            geom_utm = transform(project_to_utm, row.geometry)
-            area = geom_utm.area
-            
             buildings.append(Building(
                 id=hash(str(row.get('id', idx))) % (10**9),
-                lat=centroid.y,
-                lon=centroid.x,
-                area_sqm=area,
+                lat=centroids.iloc[i].y,
+                lon=centroids.iloc[i].x,
+                area_sqm=float(area_values[i]),
                 geometry=row.geometry
             ))
-        except Exception as e:
+        except Exception:
             continue
-    
+
     return buildings, gdf
 
 
 def get_building_polygons_ms(
     lat: float,
-    lon: float, 
+    lon: float,
     radius_meters: float
 ) -> List[dict]:
     """
@@ -155,11 +223,10 @@ def get_building_polygons_ms(
     Returns list of dicts compatible with the visualization module.
     """
     buildings, gdf = query_ms_buildings_in_radius(lat, lon, radius_meters)
-    
+
     polygons = []
     for building in buildings:
         try:
-            # Convert shapely geometry to list of coordinates
             if building.geometry.geom_type == 'Polygon':
                 coords = [(y, x) for x, y in building.geometry.exterior.coords]
             elif building.geometry.geom_type == 'MultiPolygon':
@@ -167,9 +234,9 @@ def get_building_polygons_ms(
                 coords = [(y, x) for x, y in largest.exterior.coords]
             else:
                 continue
-        except:
+        except Exception:
             continue
-            
+
         polygons.append({
             "id": building.id,
             "coordinates": coords,
@@ -177,5 +244,5 @@ def get_building_polygons_ms(
             "center": (building.lat, building.lon),
             "area_sqm": building.area_sqm
         })
-    
+
     return polygons

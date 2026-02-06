@@ -12,7 +12,7 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ms_buildings import query_ms_buildings_in_radius, get_building_polygons_ms
+from ms_buildings import query_ms_buildings_in_radius, get_building_polygons_ms, count_buildings_in_radius
 from osm_query import query_osm_buildings, get_osm_building_polygons
 from visualization import (
     create_map_image,
@@ -80,25 +80,22 @@ async def count_buildings(
     radius_meters = radius_km * 1000
     
     try:
-        # Run blocking query in thread pool to allow concurrent requests
-        buildings, _ = await asyncio.get_event_loop().run_in_executor(
-            executor, query_ms_buildings_in_radius, lat, lon, radius_meters
+        # Fast path: vectorized count, no Building object creation
+        count, total_area, avg_area = await asyncio.get_event_loop().run_in_executor(
+            executor, count_buildings_in_radius, lat, lon, radius_meters
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error querying buildings: {str(e)}")
-    
-    total_area = sum(b.area_sqm for b in buildings)
-    avg_area = total_area / len(buildings) if buildings else 0
     
     return BuildingCountResponse(
         latitude=lat,
         longitude=lon,
         radius_meters=radius_meters,
         radius_km=radius_km,
-        building_count=len(buildings),
-        total_area_sqm=round(total_area, 2),
-        avg_building_area_sqm=round(avg_area, 2),
-        message=f"Found {len(buildings)} buildings within {radius_km}km"
+        building_count=count,
+        total_area_sqm=total_area,
+        avg_building_area_sqm=avg_area,
+        message=f"Found {count} buildings within {radius_km}km"
     )
 
 
