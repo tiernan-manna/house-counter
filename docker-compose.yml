@@ -1,0 +1,13 @@
+services:
+  house-counter:
+    build: .
+    ports:
+      - "8008:8008"
+    volumes:
+      - building_cache:/app/building_cache
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  building_cache:

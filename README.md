@@ -11,15 +11,22 @@ Count buildings within a given radius using Microsoft Building Footprints (ML-de
 
 ## Installation
 
+### Docker (recommended)
+
+```bash
+docker compose up --build
+```
+
+The server runs on `http://localhost:8008`. Building data cache is persisted in a Docker volume.
+
+To pass environment variables (e.g. `GOOGLE_TILES_API_KEY`), create a `.env` file in the project root before starting the container.
+
+### Local
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-```
-
-## Running the Server
-
-```bash
 python main.py
 ```
 

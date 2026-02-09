@@ -12,6 +12,29 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
+# Platform-aware font discovery
+_FONT_SEARCH_PATHS = [
+    # macOS
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/SFNSMono.ttf",
+    # Linux (Liberation Sans — installed in Docker image)
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    # Windows
+    "C:/Windows/Fonts/arial.ttf",
+]
+
+
+def _find_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Return the first available TrueType font at *size*, or the built-in default."""
+    for path in _FONT_SEARCH_PATHS:
+        if os.path.isfile(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -324,15 +347,11 @@ def create_map_image(
     )
     
     # Add text overlay with count
-    try:
-        # Scale font size with image
-        font_size = max(24, img_width // 50)
-        small_font_size = max(16, img_width // 75)
-        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
-        small_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", small_font_size)
-    except:
-        font = ImageFont.load_default()
-        small_font = font
+    # Scale font size with image
+    font_size = max(24, img_width // 50)
+    small_font_size = max(16, img_width // 75)
+    font = _find_font(font_size)
+    small_font = _find_font(small_font_size)
     
     # Create semi-transparent overlay for text
     overlay = Image.new("RGBA", composite.size, (0, 0, 0, 0))
@@ -454,12 +473,8 @@ def create_simple_marker_map(
     )
     
     # Add text
-    try:
-        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 24)
-        small_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
-    except:
-        font = ImageFont.load_default()
-        small_font = font
+    font = _find_font(24)
+    small_font = _find_font(16)
     
     overlay = Image.new("RGBA", composite.size, (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay)
